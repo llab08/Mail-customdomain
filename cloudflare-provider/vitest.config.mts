@@ -27,11 +27,14 @@ export default defineConfig({
           ADMIN_SESSION_SECRET: 'test-session-secret-not-real-0123456789abcdef',
           FORWARD_RULES: JSON.stringify({ 'hello@private.test': 'owner@forward.test' }),
           TEST_ADMIN_PASSWORD,
+          // D1_READS_REPORT=1 npx vitest run test/d1-reads.test.ts --reporter=verbose prints the rows-read table.
+          D1_READS_REPORT: process.env.D1_READS_REPORT || '',
         },
       },
     }),
   ],
   test: {
     include: ['test/**/*.test.ts'],
+    setupFiles: ['./test/setup.ts'],
   },
 });

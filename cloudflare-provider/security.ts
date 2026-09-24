@@ -156,7 +156,14 @@ export interface FailureRule {
 }
 
 export const FAILURE_WINDOW_SECONDS = 15 * 60;
+/**
+ * Expired counter rows deleted per attempt at most. Each attempt adds at most
+ * one row per rule, so this keeps up while keeping every cleanup small (it
+ * reads through idx_auth_failures_window_start, never the whole table).
+ */
+export const EXPIRED_ROWS_PER_CLEANUP = 50;
 
+/** Created by the schema setup (database.js), together with the window_start index. */
 export async function ensureAuthFailuresTable(db: D1Database): Promise<void> {
   await db.exec(
     'CREATE TABLE IF NOT EXISTS auth_failures (key TEXT PRIMARY KEY, count INTEGER NOT NULL, window_start INTEGER NOT NULL)'
@@ -266,20 +273,29 @@ export async function limitClientIp(request: Request, env: { CLIENT_IP_SECRET?: 
  * still in flight.
  */
 export async function takeAttempt(db: D1Database, rules: FailureRule[], now: number = nowSeconds()): Promise<number> {
-  await ensureAuthFailuresTable(db);
   const expired = now - FAILURE_WINDOW_SECONDS;
   const keys = await Promise.all(rules.map(r => storageKey(r.key)));
   const results = await db.batch<{ count: number; window_start: number }>([
-    db.prepare('DELETE FROM auth_failures WHERE window_start <= ?').bind(expired),
-    ...keys.map(key => db.prepare(
-      `INSERT INTO auth_failures (key, count, window_start) VALUES (?, 1, ?)
-       ON CONFLICT(key) DO UPDATE SET count = auth_failures.count + 1
-       RETURNING count, window_start`
-    ).bind(key, now)),
+    // Garbage collection of old windows, bounded and through the
+    // window_start index (it used to delete, and read, the whole table).
+    db.prepare(
+      `DELETE FROM auth_failures WHERE rowid IN
+         (SELECT rowid FROM auth_failures WHERE window_start <= ? ORDER BY window_start LIMIT ?)`
+    ).bind(expired, EXPIRED_ROWS_PER_CLEANUP),
+    ...keys.flatMap(key => [
+      // This key's own expired window is always dropped first, so the limits
+      // never depend on how far the bounded cleanup above got.
+      db.prepare('DELETE FROM auth_failures WHERE key = ? AND window_start <= ?').bind(key, expired),
+      db.prepare(
+        `INSERT INTO auth_failures (key, count, window_start) VALUES (?, 1, ?)
+         ON CONFLICT(key) DO UPDATE SET count = auth_failures.count + 1
+         RETURNING count, window_start`
+      ).bind(key, now),
+    ]),
   ]);
   let wait = 0;
   rules.forEach((rule, i) => {
-    const row = results[i + 1]?.results?.[0];
+    const row = results[2 + 2 * i]?.results?.[0];
     if (!row) return;
     if (Number(row.count) > rule.limit) {
       wait = Math.max(wait, Number(row.window_start) + FAILURE_WINDOW_SECONDS - now, 1);

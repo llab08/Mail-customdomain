@@ -148,6 +148,26 @@ Every POST needs the same `Origin` and a per-session CSRF token. Failed admin lo
 - Logins are matched on `lower(trim(username))` (index `idx_users_username_norm`); when old data holds several rows for one address, the oldest wins, so a later twin such as `victim@` next to a legacy `Victim@` gets neither a token nor the mailbox.
 - New passwords are stored as salted PBKDF2; old unsalted SHA-256 hashes still verify and are upgraded on the next successful login.
 
+## D1 rows read
+
+D1 bills (and on the free plan, caps at 5,000,000 per day) every row a statement *reads*, not the rows it returns. The Worker therefore:
+
+- checks the schema once per isolate (one `sqlite_master` lookup of the newest index, ~20 rows) and runs the full, idempotent migration in `database.js` only when that index is missing — never on every request;
+- keeps every request on indexes: `idx_users_username_norm` for logins and token re-checks, `idx_messages_mailbox_received (mailbox_id, received_at)` for message lists and counts, `idx_auth_failures_window_start` for the bounded cleanup of old failure counters (at most 50 rows per attempt);
+- builds the admin mailbox list from one pass over the mailbox addresses plus a few index rows per private mailbox, and counts messages only for the mailboxes on the shown page.
+
+On production-like volumes (5,000 mailboxes, 5,000 users, 7,500 messages) an API request reads at most ~35 rows (most 0–10) and an email delivery 6. What still grows with the data:
+- `GET /messages` reads the messages up to the requested page and, when that page is full, one index row per message of that mailbox for `hydra:totalItems` (a 300-message inbox: ~330 rows per call; the web app polls page 1 every 30 s per open tab);
+- `POST /token` and `/admin/login` read up to ~200 more rows while a backlog of expired failure counters is being cleaned (50 per attempt);
+- `/admin` reads every mailbox address and every username once, plus ~3 index rows per private mailbox (~12,000 rows with 200 private mailboxes, ~18,000 with 1,500); `/admin/mailbox` counts that mailbox's messages;
+- the first request after deploying this version builds `idx_messages_mailbox_received` once (~2 rows read and 1 written per message). An isolate of the previous version that serves a request during the rollout may re-create the old `idx_messages_mailbox_id`; that is harmless (one more index row written per new message) and `DROP INDEX idx_messages_mailbox_id` removes it.
+
+`test/d1-reads.test.ts` enforces these budgets; print the table with every statement:
+
+```bash
+D1_READS_REPORT=1 npx vitest run test/d1-reads.test.ts --reporter=verbose
+```
+
 ## Tests
 
 ```bash

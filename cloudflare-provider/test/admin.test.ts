@@ -349,6 +349,12 @@ describe('admin pages', () => {
     const second = await (await call('GET', '/admin?page=2', { cookie })).text();
     expect(second).toContain('page 2 of 2');
     expect((second.slice(second.indexOf('Private mailboxes'), second.indexOf('Blocked leftovers')).match(/<tr>/g) || []).length).toBe(1 + 52);
+    // A page past the end shows the last page.
+    const past = await (await call('GET', '/admin?page=9', { cookie })).text();
+    const pastBody = past.slice(past.indexOf('Private mailboxes'), past.indexOf('Blocked leftovers'));
+    expect(pastBody).toContain('152 mailbox(es)');
+    expect(pastBody).toContain('page 2 of 2');
+    expect((pastBody.match(/<tr>/g) || []).length).toBe(1 + 52);
 
     const found = await (await call('GET', '/admin?q=SPAM149', { cookie })).text();
     expect(found).toContain('spam149@private.test');

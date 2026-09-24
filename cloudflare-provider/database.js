@@ -1,52 +1,115 @@
+import { ensureAuthFailuresTable } from './security';
+
+// Schema setup.
+//
+// D1 bills every row a statement reads, so nothing here may scan a data table
+// on the request path. The Worker calls ensureSchema() before using D1: it
+// checks the schema once per isolate (one lookup of SCHEMA_MARKER in
+// sqlite_master, ~20 rows) and runs the full, idempotent migrateSchema() only
+// when that marker is missing. (Until September 2026 the whole setup ran on
+// every request, including a COUNT over all of messages: ~7,500 rows read per
+// request.)
+
+/**
+ * The last object migrateSchema() creates: when it exists, every earlier
+ * step has run. Give it a new name when adding a migration step.
+ */
+export const SCHEMA_MARKER = 'idx_auth_failures_window_start';
+
+// Only a flag is kept per isolate (plain data, never a promise or other I/O
+// object shared across requests). Requests that arrive while the first
+// check is still running do the same cheap check themselves.
+let schemaReady = false;
+
+/** Makes sure the schema is current, at most once per isolate. Never throws. */
+export async function ensureSchema(db) {
+  if (schemaReady) return;
+  try {
+    const marker = await db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .bind(SCHEMA_MARKER).first();
+    if (!marker) await migrateSchema(db);
+    schemaReady = true;
+  } catch (error) {
+    // As before, a failed setup does not fail the request; the next request tries again.
+    console.error('Schema setup failed:', error);
+  }
+}
+
+/** Tests only: the next ensureSchema() checks again (after the test wiped the database). */
+export function forgetSchemaCheck() {
+  schemaReady = false;
+}
+
+/** Runs the full migration now (errors are logged, not thrown). */
 export async function initDatabase(db) {
   try {
-    // 新结构：mailboxes（地址历史） + messages（邮件）
-    await db.exec(`PRAGMA foreign_keys = ON;`);
-    await db.exec("CREATE TABLE IF NOT EXISTS mailboxes (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT NOT NULL UNIQUE, local_part TEXT NOT NULL, domain TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_accessed_at TEXT, expires_at TEXT, is_pinned INTEGER DEFAULT 0);");
-    await db.exec(`CREATE INDEX IF NOT EXISTS idx_mailboxes_address ON mailboxes(address);`);
-    await db.exec(`CREATE INDEX IF NOT EXISTS idx_mailboxes_is_pinned ON mailboxes(is_pinned DESC);`);
-
-    await db.exec("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mailbox_id INTEGER NOT NULL, sender TEXT NOT NULL, subject TEXT NOT NULL, content TEXT NOT NULL, html_content TEXT, received_at TEXT DEFAULT CURRENT_TIMESTAMP, is_read INTEGER DEFAULT 0, FOREIGN KEY(mailbox_id) REFERENCES mailboxes(id));");
-    await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id);`);
-    await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at DESC);`);
-
-    // 用户与授权关系表
-    await ensureUsersTables(db);
-
-    // 发送记录表：用于记录通过 Resend 发出的邮件与状态
-    await ensureSentEmailsTable(db);
-
-    // 兼容迁移：若存在旧表 emails 且新表 messages 为空，则尝试迁移数据
-    const legacy = await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='emails'").all();
-    const mc = await db.prepare('SELECT COUNT(1) as c FROM messages').all();
-    const msgCount = Array.isArray(mc?.results) && mc.results.length ? mc.results[0].c : 0;
-    if (Array.isArray(legacy?.results) && legacy.results.length > 0 && msgCount === 0) {
-      const res = await db.prepare('SELECT * FROM emails').all();
-      const rows = res?.results || [];
-      if (rows && rows.length) {
-        for (const r of rows) {
-          const mailboxId = await getOrCreateMailboxId(db, r.mailbox);
-          await db.prepare(`INSERT INTO messages (mailbox_id, sender, subject, content, html_content, received_at, is_read)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`)
-            .bind(mailboxId, r.sender, r.subject, r.content, r.html_content || null, r.received_at || null, r.is_read || 0)
-            .run();
-        }
-      }
-    }
-
-    // 迁移：为现有邮箱添加 is_pinned 字段
-    try {
-      const res = await db.prepare("PRAGMA table_info(mailboxes)").all();
-      const cols = (res?.results || []).map(r => (r.name || r?.['name']));
-      if (!cols.includes('is_pinned')){
-        await db.exec('ALTER TABLE mailboxes ADD COLUMN is_pinned INTEGER DEFAULT 0');
-        await db.exec('CREATE INDEX IF NOT EXISTS idx_mailboxes_is_pinned ON mailboxes(is_pinned DESC)');
-      }
-    } catch (error) {
-      console.warn('Migration warning (is_pinned column may already exist):', error.message);
-    }
+    await migrateSchema(db);
   } catch (error) {
     console.error('数据库初始化失败:', error);
+  }
+}
+
+/** Creates and upgrades every table and index. Idempotent; throws on failure. */
+export async function migrateSchema(db) {
+  await db.exec(`PRAGMA foreign_keys = ON;`);
+
+  // 新结构：mailboxes（地址历史） + messages（邮件）
+  await db.exec("CREATE TABLE IF NOT EXISTS mailboxes (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT NOT NULL UNIQUE, local_part TEXT NOT NULL, domain TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_accessed_at TEXT, expires_at TEXT, is_pinned INTEGER DEFAULT 0);");
+  // 迁移：为现有邮箱添加 is_pinned 字段 (before its index, which needs the column)
+  try {
+    const res = await db.prepare("PRAGMA table_info(mailboxes)").all();
+    const cols = (res?.results || []).map(r => (r.name || r?.['name']));
+    if (!cols.includes('is_pinned')){
+      await db.exec('ALTER TABLE mailboxes ADD COLUMN is_pinned INTEGER DEFAULT 0');
+    }
+  } catch (error) {
+    console.warn('Migration warning (is_pinned column may already exist):', error.message);
+  }
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_mailboxes_address ON mailboxes(address);`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_mailboxes_is_pinned ON mailboxes(is_pinned DESC);`);
+
+  await db.exec("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mailbox_id INTEGER NOT NULL, sender TEXT NOT NULL, subject TEXT NOT NULL, content TEXT NOT NULL, html_content TEXT, received_at TEXT DEFAULT CURRENT_TIMESTAMP, is_read INTEGER DEFAULT 0, FOREIGN KEY(mailbox_id) REFERENCES mailboxes(id));");
+  // One mailbox's messages, newest first: GET /messages pages, COUNT per
+  // mailbox, and MAX(received_at) per mailbox (one index row) on /admin.
+  // It replaces idx_messages_mailbox_id (its prefix), so a new message still
+  // writes the same number of index rows.
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_mailbox_received ON messages(mailbox_id, received_at);`);
+  await db.exec(`DROP INDEX IF EXISTS idx_messages_mailbox_id;`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at DESC);`);
+
+  // 用户与授权关系表
+  await ensureUsersTables(db);
+
+  // 发送记录表：用于记录通过 Resend 发出的邮件与状态
+  await ensureSentEmailsTable(db);
+
+  await migrateLegacyEmails(db);
+
+  // Failure counters for /token and /admin/login (security.ts). The index
+  // keeps the expired-row cleanup an index range instead of a table scan.
+  await ensureAuthFailuresTable(db);
+  // Keep this the last statement: it is SCHEMA_MARKER.
+  await db.exec(`CREATE INDEX IF NOT EXISTS ${SCHEMA_MARKER} ON auth_failures(window_start);`);
+}
+
+/**
+ * 兼容迁移：若存在旧表 emails 且新表 messages 为空，则迁移数据。
+ * The table is looked up by name first; messages is only probed for one row
+ * (never counted) and only on installs that still have the old table.
+ */
+async function migrateLegacyEmails(db) {
+  const legacy = await db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'emails'").first();
+  if (!legacy) return;
+  const hasMessages = await db.prepare('SELECT 1 AS ok FROM messages LIMIT 1').first();
+  if (hasMessages) return;
+  const res = await db.prepare('SELECT * FROM emails').all();
+  const rows = res?.results || [];
+  for (const r of rows) {
+    const mailboxId = await getOrCreateMailboxId(db, r.mailbox);
+    await db.prepare(`INSERT INTO messages (mailbox_id, sender, subject, content, html_content, received_at, is_read)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .bind(mailboxId, r.sender, r.subject, r.content, r.html_content || null, r.received_at || null, r.is_read || 0)
+      .run();
   }
 }
 
