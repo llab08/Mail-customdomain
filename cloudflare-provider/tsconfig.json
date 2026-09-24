@@ -2,16 +2,27 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
-    "lib": ["ES2022"],
-    "moduleResolution": "node",
+    "lib": [
+      "ES2022"
+    ],
+    "moduleResolution": "Bundler",
     "allowJs": true,
     "checkJs": false,
     "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"]
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers/types"
+    ]
   },
-  "include": ["**/*.ts", "**/*.js"],
-  "exclude": ["node_modules", "dist"]
-} 
+  "include": [
+    "**/*.ts",
+    "**/*.js"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}

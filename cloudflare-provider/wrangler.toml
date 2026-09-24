@@ -2,6 +2,8 @@ name = "duckmail-cloudflare-provider"
 main = "worker.ts"
 compatibility_date = "2024-12-01"
 account_id = "16feb2508c920d0cd79a8c60c4d8c430"
+# Keep the *.workers.dev URL the DuckMail web app calls.
+workers_dev = true
 
 [[d1_databases]]
 binding = "TEMP_MAIL_DB"
@@ -9,11 +11,26 @@ database_name = "temp_mail_db"
 database_id = "70bece35-d5bf-487b-9730-c7546f0266c3"
 
 [vars]
+# Public domains: listed by GET /domains; anyone can create an account.
 MAIL_DOMAIN = "10xco.de"
-JWT_TOKEN = "tusiKCfuyXrwDPrsP77GHZtSSdMux6AqDZQKmySpBss="
-# Optional: RESEND_API_KEY = "<your-resend-api-key>"
+# Private domains: mail is still received and stored, but the public API
+# never lists them, refuses POST /accounts (403) and refuses logins that the
+# admin did not create. Read this mail at /admin.
+PRIVATE_DOMAINS = "llab08.com"
+# Optional forwarding after storing, JSON {"address":"verified destination"},
+# e.g. {"name@llab08.com":"you@example.com"}. The destination must be a
+# verified Email Routing destination address. Empty = no forwarding.
+FORWARD_RULES = ""
 
-# If you want to test locally with wrangler dev
-[env.development.vars]
-MAIL_DOMAIN = "test.local"
-JWT_TOKEN = "development-secret-key" 
+# `wrangler deploy` refuses to deploy while any of these is missing.
+[secrets]
+required = ["JWT_SECRET", "ADMIN_PASSWORD_HASH", "ADMIN_SESSION_SECRET"]
+
+# Secrets — set with `wrangler secret put` (see README.md),
+# never in this file:
+#   JWT_SECRET            signs the API tokens (replaces the old JWT_TOKEN var)
+#   ADMIN_PASSWORD_HASH   pbkdf2-sha256$<iterations>$<salt b64>$<hash b64>
+#   ADMIN_SESSION_SECRET  signs the /admin session cookie
+
+# Local development: `npx wrangler dev` (local D1 only, nothing remote), with
+# the secrets above in .dev.vars (see .dev.vars.example).
