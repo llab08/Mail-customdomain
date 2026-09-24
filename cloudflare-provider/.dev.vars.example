@@ -1,0 +1,5 @@
+# Copy to .dev.vars for `npx wrangler dev` (never commit .dev.vars).
+JWT_SECRET="replace-with-a-random-local-value"
+# Generate with: node -e 'const c=require("crypto");const s=c.randomBytes(16);const h=c.pbkdf2Sync(process.argv[1],s,100000,32,"sha256");console.log(`pbkdf2-sha256$100000$${s.toString("base64")}$${h.toString("base64")}`)' 'local-admin-password'
+ADMIN_PASSWORD_HASH="pbkdf2-sha256$100000$<salt b64>$<hash b64>"
+ADMIN_SESSION_SECRET="replace-with-at-least-32-random-characters"

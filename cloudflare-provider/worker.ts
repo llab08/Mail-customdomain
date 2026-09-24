@@ -2,13 +2,63 @@ import type { EmailMessage } from '@cloudflare/workers-types';
 import { initDatabase, getOrCreateMailboxId, getMailboxIdByAddress } from './database.js';
 import { createJwt, verifyJwt, base64UrlDecode } from './authentication.js';
 import { parseEmailBody } from './emailParser.js';
+import { handleAdmin } from './admin';
+import {
+  USER_PBKDF2_ITERATIONS,
+  findUserByAddress,
+  forwardTarget,
+  hashPassword,
+  isLegacyHash,
+  isPrivateAddress,
+  limitClientIp,
+  normalizeAddress,
+  publicDomains,
+  rateKeyForIp,
+  settleSuccess,
+  splitAddress,
+  takeAttempt,
+  tokenStillValid,
+  userMayUseAddress,
+  verifyPassword,
+} from './security';
 
 interface Env {
   TEMP_MAIL_DB: D1Database;
+  /** Public domains: listed by /domains, anyone may create accounts. */
   MAIL_DOMAIN: string;
-  JWT_TOKEN: string;
+  /** Private domains: mail is stored, only the admin portal (or admin-created logins) can read it. */
+  PRIVATE_DOMAINS?: string;
+  /**
+   * Signs the API tokens (secret, 32+ characters). Required: the old JWT_TOKEN
+   * var is NOT used as a fallback, because its value is in the public repo
+   * history and anyone could sign tokens with it.
+   */
   JWT_SECRET?: string;
+  /**
+   * Shared with the DuckMail web app (secret, 32+ characters): lets its
+   * /api/mail proxy pass the browser's IP for the /token failure limits.
+   */
+  CLIENT_IP_SECRET?: string;
+  /** pbkdf2-sha256$<iterations>$<salt b64>$<hash b64> of the admin password (secret). */
+  ADMIN_PASSWORD_HASH?: string;
+  /** HMAC key for the admin session cookie (secret, 32+ chars). */
+  ADMIN_SESSION_SECRET?: string;
+  /** Optional JSON object {"address":"verified destination"} for message.forward(). */
+  FORWARD_RULES?: string;
   RESEND_API_KEY?: string;
+}
+
+/** Failed /token logins allowed per 15 minutes for one address from one client. */
+const TOKEN_FAILURES_PER_IP_AND_ADDRESS = 10;
+/** Failed /token logins allowed per 15 minutes from one client across all addresses. */
+const TOKEN_FAILURES_PER_IP = 100;
+/** Shortest JWT_SECRET the Worker accepts; the deploy script sets a 64-character one. */
+const MIN_JWT_SECRET_LENGTH = 32;
+
+/** The token signing key, or null when it is missing or too short (the Worker then fails closed). */
+function jwtSecretOf(env: Env): string | null {
+  const secret = env.JWT_SECRET;
+  return typeof secret === 'string' && secret.length >= MIN_JWT_SECRET_LENGTH ? secret : null;
 }
 
 // Bearer token verification function
@@ -44,17 +94,6 @@ async function verifyBearerToken(authHeader: string | null, secret: string): Pro
   } catch (_) {
     return false;
   }
-}
-
-// Add local SHA-256 hashing helper (hex encoded)
-async function sha256Hex(text: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(String(text || ''));
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  const bytes = new Uint8Array(digest);
-  let out = '';
-  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
-  return out;
 }
 
 // Extract Subject from raw email headers (fallback)
@@ -115,6 +154,16 @@ export default {
     
     // Initialize database on first request
     await initDatabase(env.TEMP_MAIL_DB);
+
+    // Admin portal (HTML, cookie session; no CORS)
+    if (pathname === '/admin' || pathname.startsWith('/admin/')) {
+      try {
+        return await handleAdmin(request, env);
+      } catch (error) {
+        console.error('Admin error:', error);
+        return new Response('Internal Server Error', { status: 500, headers: { 'Cache-Control': 'no-store' } });
+      }
+    }
     
     // CORS headers
     const corsHeaders = {
@@ -131,32 +180,43 @@ export default {
     try {
       // Public endpoints
       if (method === 'GET' && pathname === '/domains') {
-        return handleGetDomains(env);
+        return await handleGetDomains(env);
       }
       
       if (method === 'POST' && pathname === '/accounts') {
-        return handleCreateAccount(request, env);
+        return await handleCreateAccount(request, env);
       }
       
       if (method === 'POST' && pathname === '/token') {
-        return handleCreateToken(request, env);
+        return await handleCreateToken(request, env);
       }
       
       // Protected endpoints - require Bearer token
       const authHeader = request.headers.get('Authorization');
-      const jwtSecret = env.JWT_SECRET || env.JWT_TOKEN;
+      const jwtSecret = jwtSecretOf(env);
+      if (!jwtSecret) {
+        console.error('JWT_SECRET is missing or shorter than 32 characters; refusing all tokens.');
+        return errorResponse('Service not configured', 503);
+      }
       const payload = await verifyBearerToken(authHeader, jwtSecret);
       
       if (!payload) {
         return errorResponse('Unauthorized', 401);
       }
+
+      // Re-check the token against the database on every request, so deleted
+      // or blocked users (e.g. public-created private-domain logins) lose access
+      // even with a token issued earlier.
+      if (!(await tokenStillValid(env, payload))) {
+        return errorResponse('Unauthorized', 401);
+      }
       
       if (method === 'GET' && pathname === '/me') {
-        return handleGetMe(payload, env);
+        return await handleGetMe(payload, env);
       }
       
       if (method === 'GET' && pathname === '/messages') {
-        return handleGetMessages(url, payload, env);
+        return await handleGetMessages(url, payload, env);
       }
       
       const messageMatch = pathname.match(/^\/messages\/(.+)$/);
@@ -164,15 +224,15 @@ export default {
         const messageId = messageMatch[1];
         
         if (method === 'GET') {
-          return handleGetMessage(messageId, payload, env);
+          return await handleGetMessage(messageId, payload, env);
         }
         
         if (method === 'PATCH') {
-          return handlePatchMessage(request, messageId, payload, env);
+          return await handlePatchMessage(request, messageId, payload, env);
         }
         
         if (method === 'DELETE') {
-          return handleDeleteMessage(messageId, payload, env);
+          return await handleDeleteMessage(messageId, payload, env);
         }
       }
       
@@ -187,9 +247,9 @@ export default {
   // Email event handler for Cloudflare Email Routing
   async email(message: EmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
     await initDatabase(env.TEMP_MAIL_DB);
+    const toAddress = (message as any).to?.toLowerCase?.() || String((message as any).to || '').toLowerCase();
     
     try {
-      const toAddress = (message as any).to?.toLowerCase?.() || String((message as any).to || '').toLowerCase();
       const mailboxId = await getOrCreateMailboxId(env.TEMP_MAIL_DB, toAddress);
       
       // Parse email content
@@ -217,13 +277,25 @@ export default {
     } catch (error) {
       console.error('Email processing error:', error);
     }
+
+    // Optional forwarding (FORWARD_RULES). Runs after the copy is stored, and a
+    // failed forward never affects the stored copy.
+    const target = forwardTarget(env, toAddress);
+    if (target) {
+      try {
+        await (message as any).forward(target);
+      } catch (error) {
+        console.error('Forward error:', error);
+      }
+    }
   }
 };
 
 // API Handlers
 
 async function handleGetDomains(env: Env): Promise<Response> {
-  const domains = (env.MAIL_DOMAIN || '').split(/[\s,]+/).filter(d => d);
+  // Only public domains; PRIVATE_DOMAINS are never listed.
+  const domains = publicDomains(env);
   
   const hydraMembers = domains.map(domain => ({
     id: domain,
@@ -238,43 +310,70 @@ async function handleGetDomains(env: Env): Promise<Response> {
   });
 }
 
+async function readJson(request: Request): Promise<any> {
+  try {
+    const body = await request.json();
+    return body && typeof body === 'object' ? body : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+// Mail.tm style "already used" answer.
+function addressAlreadyUsed(): Response {
+  return jsonResponse({
+    '@context': '/contexts/ConstraintViolationList',
+    '@type': 'ConstraintViolationList',
+    'hydra:title': 'An error occurred',
+    'hydra:description': 'address: This value is already used.',
+    violations: [{ propertyPath: 'address', message: 'This value is already used.' }],
+    error: 'This value is already used.',
+  }, 422);
+}
+
 async function handleCreateAccount(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as any;
+  const body = await readJson(request);
   const { address, password } = body;
   
-  if (!address || !password) {
+  if (!address || !password || typeof address !== 'string' || typeof password !== 'string') {
     return errorResponse('Address and password are required');
   }
   
   // Validate domain
-  const [localPart, domain] = address.split('@');
-  const allowedDomains = (env.MAIL_DOMAIN || '').split(/[\s,]+/).filter(d => d);
-  
-  if (!allowedDomains.includes(domain)) {
+  const parts = splitAddress(address);
+  if (!parts) {
+    return errorResponse('Invalid domain');
+  }
+  const normalized = `${parts.local}@${parts.domain}`;
+
+  if (isPrivateAddress(env, normalized)) {
+    return errorResponse('This domain is private', 403);
+  }
+  if (!publicDomains(env).includes(parts.domain)) {
     return errorResponse('Invalid domain');
   }
   
+  // An address that already has a login is never reset or taken over.
+  if (await findUserByAddress(env.TEMP_MAIL_DB, address)) {
+    return addressAlreadyUsed();
+  }
+  
   // Get or create mailbox
-  const mailboxId = await getOrCreateMailboxId(env.TEMP_MAIL_DB, address);
+  const mailboxId = await getOrCreateMailboxId(env.TEMP_MAIL_DB, normalized);
   
-  // Store password hash (create or update user auth record)
-  const passwordHash = await sha256Hex(password);
+  // Salted PBKDF2 (legacy SHA-256 hashes are still accepted at /token)
+  const passwordHash = await hashPassword(password, USER_PBKDF2_ITERATIONS);
   
-  // Check if auth record exists
-  const existing = await env.TEMP_MAIL_DB.prepare(
-    'SELECT id FROM users WHERE username = ?'
-  ).bind(address).first();
-  
-  if (existing) {
-    // Update password
-    await env.TEMP_MAIL_DB.prepare(
-      'UPDATE users SET password_hash = ? WHERE username = ?'
-    ).bind(passwordHash, address).run();
-  } else {
-    // Create new user auth record
+  try {
     await env.TEMP_MAIL_DB.prepare(
       'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)'
-    ).bind(address, passwordHash, 'user').run();
+    ).bind(normalized, passwordHash, 'user').run();
+  } catch (error) {
+    // UNIQUE(username): a concurrent request created it first.
+    if (/unique/i.test(String((error as any)?.message || error))) {
+      return addressAlreadyUsed();
+    }
+    throw error;
   }
   
   // Return account object
@@ -292,36 +391,66 @@ async function handleCreateAccount(request: Request, env: Env): Promise<Response
 }
 
 async function handleCreateToken(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as any;
+  const body = await readJson(request);
   const { address, password } = body;
   
-  if (!address || !password) {
+  if (!address || !password || typeof address !== 'string' || typeof password !== 'string') {
     return errorResponse('Address and password are required');
+  }
+
+  const jwtSecret = jwtSecretOf(env);
+  if (!jwtSecret) {
+    console.error('JWT_SECRET is missing or shorter than 32 characters; refusing to issue tokens.');
+    return errorResponse('Service not configured', 503);
+  }
+
+  // Failure limits (D1): per client+address, and per client overall. The
+  // client is the browser's IP when the web app's proxy vouches for it
+  // (signed header), else CF-Connecting-IP; IPv6 counts per /64.
+  const ip = rateKeyForIp(await limitClientIp(request, env));
+  const rules = [
+    { key: `token:${ip}:${normalizeAddress(address)}`, limit: TOKEN_FAILURES_PER_IP_AND_ADDRESS },
+    { key: `token:${ip}`, limit: TOKEN_FAILURES_PER_IP },
+  ];
+  // The attempt is counted before the password is checked (atomic), so
+  // parallel requests cannot exceed the limits.
+  const wait = await takeAttempt(env.TEMP_MAIL_DB, rules);
+  if (wait > 0) {
+    const res = errorResponse('Too many failed login attempts. Try again later.', 429);
+    res.headers.set('Retry-After', String(wait));
+    return res;
   }
   
   // Get user auth record
-  const user = await env.TEMP_MAIL_DB.prepare(
-    'SELECT id, password_hash FROM users WHERE username = ?'
-  ).bind(address).first();
+  const user = await findUserByAddress(env.TEMP_MAIL_DB, address);
   
-  if (!user) {
+  // Verify password; private-domain addresses need an admin-created login.
+  const ok = !!user
+    && password.length <= 1024
+    && (await verifyPassword(password, user.password_hash))
+    && userMayUseAddress(env, user, address)
+    && userMayUseAddress(env, user, user.username);
+  if (!user || !ok) {
+    // The attempt taken above stays counted as a failure.
     return errorResponse('Invalid credentials', 401);
   }
-  
-  // Verify password
-  const passwordHash = await sha256Hex(password);
-  if (passwordHash !== user.password_hash) {
-    return errorResponse('Invalid credentials', 401);
+  // Success: not a failure. Clears this address's counter, refunds the per-client one.
+  await settleSuccess(env.TEMP_MAIL_DB, rules, [rules[0].key]);
+
+  // Upgrade a legacy unsalted SHA-256 hash now that the password is known.
+  if (isLegacyHash(user.password_hash)) {
+    await env.TEMP_MAIL_DB.prepare(
+      'UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?'
+    ).bind(await hashPassword(password, USER_PBKDF2_ITERATIONS), user.id, user.password_hash).run();
   }
   
   // Get mailbox ID
-  const mailboxId = await getMailboxIdByAddress(env.TEMP_MAIL_DB, address);
+  const mailboxId = await getMailboxIdByAddress(env.TEMP_MAIL_DB, user.username);
   if (!mailboxId) {
     return errorResponse('Mailbox not found', 404);
   }
   
   // Create JWT
-  const jwtSecret = env.JWT_SECRET || env.JWT_TOKEN;
   const token = await createJwt(jwtSecret, {
     address,
     mailboxId,
@@ -438,7 +567,7 @@ async function handleGetMessage(messageId: string, payload: any, env: Env): Prom
 
 async function handlePatchMessage(request: Request, messageId: string, payload: any, env: Env): Promise<Response> {
   const { mailboxId } = payload;
-  const body = await request.json() as any;
+  const body = await readJson(request);
   
   if ('seen' in body) {
     await env.TEMP_MAIL_DB.prepare(
