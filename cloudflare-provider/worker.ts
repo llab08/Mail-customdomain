@@ -1,5 +1,5 @@
 import type { EmailMessage } from '@cloudflare/workers-types';
-import { initDatabase, getOrCreateMailboxId, getMailboxIdByAddress } from './database.js';
+import { ensureSchema, getOrCreateMailboxId, getMailboxIdByAddress } from './database.js';
 import { createJwt, verifyJwt, base64UrlDecode } from './authentication.js';
 import { parseEmailBody } from './emailParser.js';
 import { handleAdmin } from './admin';
@@ -152,12 +152,10 @@ export default {
     const method = request.method;
     const pathname = url.pathname;
     
-    // Initialize database on first request
-    await initDatabase(env.TEMP_MAIL_DB);
-
     // Admin portal (HTML, cookie session; no CORS)
     if (pathname === '/admin' || pathname.startsWith('/admin/')) {
       try {
+        await ensureSchema(env.TEMP_MAIL_DB);
         return await handleAdmin(request, env);
       } catch (error) {
         console.error('Admin error:', error);
@@ -182,6 +180,10 @@ export default {
       if (method === 'GET' && pathname === '/domains') {
         return await handleGetDomains(env);
       }
+
+      // Everything below uses D1. The schema is checked once per isolate
+      // (see database.js), not on every request.
+      await ensureSchema(env.TEMP_MAIL_DB);
       
       if (method === 'POST' && pathname === '/accounts') {
         return await handleCreateAccount(request, env);
@@ -246,7 +248,7 @@ export default {
   
   // Email event handler for Cloudflare Email Routing
   async email(message: EmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
-    await initDatabase(env.TEMP_MAIL_DB);
+    await ensureSchema(env.TEMP_MAIL_DB);
     const toAddress = (message as any).to?.toLowerCase?.() || String((message as any).to || '').toLowerCase();
     
     try {
@@ -485,21 +487,28 @@ async function handleGetMessages(url: URL, payload: any, env: Env): Promise<Resp
   const limit = 30;
   const offset = (page - 1) * limit;
   
-  // Get total count
-  const countResult = await env.TEMP_MAIL_DB.prepare(
-    'SELECT COUNT(*) as count FROM messages WHERE mailbox_id = ?'
-  ).bind(mailboxId).first();
-  
-  const totalCount = countResult?.count || 0;
-  
-  // Get messages
+  // Get messages, newest first (idx_messages_mailbox_received: reads only
+  // the rows up to this page; id breaks ties within the same second)
   const messages = await env.TEMP_MAIL_DB.prepare(
     `SELECT id, sender, subject, content, html_content, received_at, is_read 
      FROM messages 
      WHERE mailbox_id = ? 
-     ORDER BY received_at DESC 
+     ORDER BY received_at DESC, id DESC 
      LIMIT ? OFFSET ?`
   ).bind(mailboxId, limit, offset).all();
+  const pageRows = (messages.results || []).length;
+
+  // Total count. A page that is not full ends the list, so the total is
+  // known without counting (the usual case for an inbox that is polled).
+  let totalCount: number;
+  if (Number.isInteger(offset) && offset >= 0 && pageRows < limit && (pageRows > 0 || offset === 0)) {
+    totalCount = offset + pageRows;
+  } else {
+    const countResult = await env.TEMP_MAIL_DB.prepare(
+      'SELECT COUNT(*) as count FROM messages WHERE mailbox_id = ?'
+    ).bind(mailboxId).first();
+    totalCount = Number(countResult?.count || 0);
+  }
   
   const hydraMembers = (messages.results || []).map(msg => {
     // Extract intro from content

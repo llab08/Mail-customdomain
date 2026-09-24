@@ -271,28 +271,47 @@ async function dashboard(env: AdminEnv, session: Session, url: URL): Promise<Res
     where += " AND m.address LIKE ? ESCAPE '\\'";
     whereBinds.push('%' + likeEsc(q) + '%');
   }
-  const total = Number((await db.prepare(`SELECT COUNT(*) AS c FROM mailboxes m WHERE ${where}`)
-    .bind(...whereBinds).first<any>())?.c || 0);
-  const pages = Math.max(1, Math.ceil(total / MAILBOXES_PER_PAGE));
-  const pageNo = Math.min(requestedPage, pages);
-
   // Mailboxes with an app login or a forwarding rule come first, so real
   // addresses (hello@, ...) stay on page 1 however much catch-all spam
   // arrives; the rest by newest mail.
+  //
+  // Rows read per view: one pass over the mailbox addresses (the private
+  // filter is a suffix LIKE), about three index rows per private mailbox
+  // (newest via idx_messages_mailbox_received, login via
+  // idx_users_username_norm), and the messages of the shown page only
+  // (message_count is computed after LIMIT). The total comes from the same
+  // pass (COUNT(*) OVER ()). "+m.address" makes the user lookups use the
+  // expression index: compared with the TEXT column itself, SQLite cannot use
+  // it and scanned every user for every private mailbox.
   const forwarded = forwardedPrivateAddresses(env);
   const pinSql = forwarded.length ? `OR m.address IN (${forwarded.map(() => '?').join(', ')})` : '';
-  const mailboxes = ((await db.prepare(
-    `SELECT m.id, m.address,
-            (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id = m.id) AS message_count,
-            (SELECT MAX(x.received_at) FROM messages x WHERE x.mailbox_id = m.id) AS newest,
-            (SELECT u.role FROM users u WHERE lower(trim(u.username)) = m.address ORDER BY u.id LIMIT 1) AS login_role,
-            (EXISTS (SELECT 1 FROM users u WHERE lower(trim(u.username)) = m.address) ${pinSql}) AS pinned
-       FROM mailboxes m
-      WHERE ${where}
-      ORDER BY pinned DESC, (newest IS NULL), newest DESC, m.id DESC
-      LIMIT ? OFFSET ?`
-  ).bind(...forwarded, ...whereBinds, MAILBOXES_PER_PAGE, (pageNo - 1) * MAILBOXES_PER_PAGE).all<any>()).results || [])
-    .filter(r => isPrivateAddress(env, r.address));
+  const pageOf = async (pageNo: number) => ((await db.prepare(
+    `SELECT p.id, p.address, p.newest, p.login_role, p.total,
+            (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id = p.id) AS message_count
+       FROM (SELECT m.id, m.address,
+                    (SELECT MAX(x.received_at) FROM messages x WHERE x.mailbox_id = m.id) AS newest,
+                    (SELECT u.role FROM users u WHERE lower(trim(u.username)) = +m.address ORDER BY u.id LIMIT 1) AS login_role,
+                    (EXISTS (SELECT 1 FROM users u WHERE lower(trim(u.username)) = +m.address) ${pinSql}) AS pinned,
+                    COUNT(*) OVER () AS total
+               FROM mailboxes m
+              WHERE ${where}
+              ORDER BY pinned DESC, (newest IS NULL), newest DESC, m.id DESC
+              LIMIT ? OFFSET ?) p
+      ORDER BY p.pinned DESC, (p.newest IS NULL), p.newest DESC, p.id DESC`
+  ).bind(...forwarded, ...whereBinds, MAILBOXES_PER_PAGE, (pageNo - 1) * MAILBOXES_PER_PAGE).all<any>()).results || []);
+
+  let pageNo = requestedPage;
+  let found = await pageOf(pageNo);
+  let total = Number(found[0]?.total || 0);
+  if (!found.length && pageNo > 1) {
+    // Past the last page: count, then show the last page.
+    total = Number((await db.prepare(`SELECT COUNT(*) AS c FROM mailboxes m WHERE ${where}`)
+      .bind(...whereBinds).first<any>())?.c || 0);
+    pageNo = Math.max(1, Math.ceil(total / MAILBOXES_PER_PAGE));
+    if (total) found = await pageOf(pageNo);
+  }
+  const pages = Math.max(1, Math.ceil(total / MAILBOXES_PER_PAGE));
+  const mailboxes = found.filter(r => isPrivateAddress(env, r.address));
 
   const uf = privateAddressFilter(env, 'u.username');
   const users = ((await db.prepare(
