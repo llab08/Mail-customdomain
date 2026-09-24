@@ -161,6 +161,21 @@ describe('GET /messages totals', () => {
     const subjects = [...p1['hydra:member'], ...p2['hydra:member']].map((m: any) => m.subject);
     expect(subjects).toEqual(Array.from({ length: 35 }, (_, i) => 'm' + (34 - i)));
   });
+
+  it('treats a page that is not a number >= 1 as page 1, and a huge page as empty (never 500)', async () => {
+    await createAccount('pages@public.test', 'pw');
+    const token = await tokenFor('pages@public.test', 'pw');
+    for (let i = 0; i < 3; i++) await deliver({ to: 'pages@public.test', subject: 'p' + i });
+    for (const p of ['abc', '', '0', '-3', '1.9']) {
+      const res = await call('GET', '/messages?page=' + p, { token });
+      expect(res.status, 'page=' + p).toBe(200);
+      const body = await json(res);
+      expect([body['hydra:member'].length, body['hydra:totalItems']], 'page=' + p).toEqual([3, 3]);
+    }
+    const huge = await call('GET', '/messages?page=99999999999999999999', { token });
+    expect(huge.status).toBe(200);
+    expect(await json(huge)).toMatchObject({ 'hydra:member': [], 'hydra:totalItems': 3 });
+  });
 });
 
 describe('legacy "emails" table', () => {

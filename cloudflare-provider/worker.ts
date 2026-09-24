@@ -483,7 +483,10 @@ async function handleGetMe(payload: any, env: Env): Promise<Response> {
 
 async function handleGetMessages(url: URL, payload: any, env: Env): Promise<Response> {
   const { mailboxId, address } = payload;
-  const page = parseInt(url.searchParams.get('page') || '1');
+  // page=abc (NaN) or a huge page (not an integer OFFSET) used to reach D1 and
+  // answer 500. Anything that is not a page number >= 1 is page 1 (0 and
+  // negatives already acted as page 1); pages stop at 1,000,000.
+  const page = Math.min(1_000_000, Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1));
   const limit = 30;
   const offset = (page - 1) * limit;
   
@@ -500,8 +503,10 @@ async function handleGetMessages(url: URL, payload: any, env: Env): Promise<Resp
 
   // Total count. A page that is not full ends the list, so the total is
   // known without counting (the usual case for an inbox that is polled).
+  // A full or empty later page needs the COUNT, which reads one index row
+  // per message of this mailbox.
   let totalCount: number;
-  if (Number.isInteger(offset) && offset >= 0 && pageRows < limit && (pageRows > 0 || offset === 0)) {
+  if (pageRows < limit && (pageRows > 0 || offset === 0)) {
     totalCount = offset + pageRows;
   } else {
     const countResult = await env.TEMP_MAIL_DB.prepare(
