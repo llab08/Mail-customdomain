@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   E, call, createAccount, deliver, getToken, json, legacyJwt, query, seedLegacyUser, tokenFor,
 } from './helpers';
+import { createJwt } from '../authentication.js';
 
 beforeEach(async () => {
   await reset();
@@ -146,6 +147,39 @@ describe('existing address', () => {
     expect((await getToken('dave@public.test', 'dave-pw')).status).toBe(200);
   });
 
+  it('refuses to create a lower-case twin of a legacy user stored as typed (mixed case or spaces)', async () => {
+    // The previous Worker stored the username exactly as typed; mailboxes were always lower-case.
+    for (const [stored, attempt] of [['Victim@public.test', 'victim@public.test'], [' spacey@public.test', 'spacey@public.test']]) {
+      await seedLegacyUser(stored, 'victim-password');
+      await deliver({ to: attempt, subject: 'victim secret' });
+      const res = await createAccount(attempt, 'attacker-password');
+      expect(res.status, stored).toBe(422);
+      expect((await getToken(attempt, 'attacker-password')).status, stored).toBe(401);
+      // The owner still logs in, in the old spelling and the normalized one.
+      expect((await getToken(stored, 'victim-password')).status, stored).toBe(200);
+      expect((await getToken(attempt, 'victim-password')).status, stored).toBe(200);
+    }
+    expect((await query('SELECT id FROM users')).length).toBe(2);
+  });
+
+  it('with duplicate legacy rows for one mailbox, the oldest login wins and newer ones get no access', async () => {
+    const victim = await seedLegacyUser('Dup@public.test', 'victim-password');
+    await deliver({ to: 'dup@public.test', subject: 'victim secret' });
+    // A lower-case twin the old Worker could still create before the deploy.
+    const intruder = await seedLegacyUser('dup@public.test', 'intruder-password');
+    expect(intruder.mailboxId).toBe(victim.mailboxId);
+
+    expect((await getToken('dup@public.test', 'intruder-password')).status).toBe(401);
+    const oldIntruderToken = await legacyJwt('dup@public.test', intruder.mailboxId, intruder.userId);
+    expect((await call('GET', '/messages', { token: oldIntruderToken })).status).toBe(401);
+
+    const token = await tokenFor('dup@public.test', 'victim-password');
+    const list = await json(await call('GET', '/messages', { token }));
+    expect(list['hydra:member'].map((m: any) => m.subject)).toEqual(['victim secret']);
+    const oldVictimToken = await legacyJwt('Dup@public.test', victim.mailboxId, victim.userId);
+    expect((await call('GET', '/me', { token: oldVictimToken })).status).toBe(200);
+  });
+
   it('still lets someone claim a mailbox that only received mail (no login yet)', async () => {
     await deliver({ to: 'fresh@public.test', subject: 'early' });
     expect((await createAccount('fresh@public.test', 'pw')).status).toBe(200);
@@ -169,5 +203,27 @@ describe('token re-check on every request', () => {
     const victimBox = (await query('SELECT id FROM mailboxes WHERE address = ?', 'victim@public.test'))[0];
     const forged = await legacyJwt('eve@public.test', Number(victimBox.id), Number(eve.id));
     expect((await call('GET', '/messages', { token: forged })).status).toBe(401);
+  });
+});
+
+describe('token signing key', () => {
+  it('fails closed without JWT_SECRET: the old public JWT_TOKEN var is never used', async () => {
+    await createAccount('kim@public.test', 'pw');
+    const good = await tokenFor('kim@public.test', 'pw');
+    const leaked = 'value-that-was-in-the-public-wrangler-toml';
+    for (const env of [{ ...E, JWT_SECRET: undefined, JWT_TOKEN: leaked }, { ...E, JWT_SECRET: 'too-short', JWT_TOKEN: leaked }]) {
+      expect((await call('POST', '/token', { body: { address: 'kim@public.test', password: 'pw' }, env })).status).toBe(503);
+      const user = (await query('SELECT id FROM users WHERE username = ?', 'kim@public.test'))[0];
+      const box = (await query('SELECT id FROM mailboxes WHERE address = ?', 'kim@public.test'))[0];
+      const forged = await createJwt(leaked, { address: 'kim@public.test', mailboxId: Number(box.id), userId: Number(user.id) });
+      expect((await call('GET', '/me', { token: forged, env })).status).toBe(503);
+      expect((await call('GET', '/me', { token: good, env })).status).toBe(503);
+    }
+    // With the real secret, a token signed with the old value is refused.
+    const user = (await query('SELECT id FROM users WHERE username = ?', 'kim@public.test'))[0];
+    const box = (await query('SELECT id FROM mailboxes WHERE address = ?', 'kim@public.test'))[0];
+    const forged = await createJwt(leaked, { address: 'kim@public.test', mailboxId: Number(box.id), userId: Number(user.id) });
+    expect((await call('GET', '/me', { token: forged, env: { ...E, JWT_TOKEN: leaked } })).status).toBe(401);
+    expect((await call('GET', '/me', { token: good })).status).toBe(200);
   });
 });

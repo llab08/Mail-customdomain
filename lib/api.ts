@@ -191,6 +191,12 @@ function getErrorMessage(status: number, errorData: any): string {
 	}
 }
 
+// An Error that keeps the HTTP status, so retryFetch can tell 401/429 apart
+// without parsing the (user-facing) message.
+function httpError(status: number, message: string): Error & { status: number } {
+	return Object.assign(new Error(message), { status })
+}
+
 // 检查是否应该重试的错误
 function shouldRetry(status: number): boolean {
 	// 不应该重试的状态码
@@ -204,6 +210,11 @@ async function retryFetch(fn: () => Promise<any>, retries = 3, delay = 1000): Pr
 		const response = await fn()
 		return response
 	} catch (error: any) {
+		// Never repeat a request the server answered with a final status
+		// (a repeated failed login would count against the login limits).
+		if (typeof error?.status === "number" && !shouldRetry(error.status)) {
+			throw error
+		}
 		// 如果错误包含状态码信息，检查是否应该重试
 		if (error.message && typeof error.message === 'string') {
 			// 从错误消息中提取状态码
@@ -387,7 +398,7 @@ export async function getToken(address: string, password: string, providerId?: s
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		return res
@@ -406,7 +417,7 @@ export async function getAccount(token: string, providerId?: string): Promise<Ac
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		return res
@@ -429,7 +440,7 @@ export async function getMessages(token: string, page = 1, providerId?: string):
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
 			logger.warn(`❌ [API] getMessages failed - Status: ${res.status}`)
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		logger.debug(`✅ [API] getMessages success - Status: ${res.status}`)
@@ -462,7 +473,7 @@ export async function getMessage(token: string, id: string, providerId?: string)
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		return res
@@ -484,7 +495,7 @@ export async function markMessageAsRead(token: string, id: string, providerId?: 
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		// API文档显示成功时返回 {"seen": true}
@@ -509,7 +520,7 @@ export async function deleteMessage(token: string, id: string, providerId?: stri
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		return res
@@ -527,7 +538,7 @@ export async function deleteAccount(token: string, id: string, providerId?: stri
 
 		if (!res.ok) {
 			const error = await res.json().catch(() => ({}))
-			throw new Error(getErrorMessage(res.status, error))
+			throw httpError(res.status, getErrorMessage(res.status, error))
 		}
 
 		return res

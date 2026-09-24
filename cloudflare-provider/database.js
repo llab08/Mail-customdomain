@@ -199,6 +199,9 @@ export async function ensureUsersTables(db){
       await db.exec('ALTER TABLE users ADD COLUMN mailbox_limit INTEGER NOT NULL DEFAULT 10');
     }
   } catch (_) {}
+  // Logins are looked up by lower(trim(username)) (older rows kept the address
+  // as typed); this expression index keeps that lookup an index seek.
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_users_username_norm ON users(lower(trim(username)))');
 
   await db.exec(
     "CREATE TABLE IF NOT EXISTS user_mailboxes (" +

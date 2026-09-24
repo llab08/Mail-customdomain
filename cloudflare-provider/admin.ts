@@ -10,17 +10,19 @@ import {
   PBKDF2_PREFIX,
   PRIVATE_ROLE,
   USER_PBKDF2_ITERATIONS,
-  blockedFor,
   bytesToB64,
-  clearFailures,
   clientIp,
+  forwardTarget,
   hashPassword,
   isPrivateAddress,
+  normalizeAddress,
   nowSeconds,
   privateDomains,
-  recordFailure,
+  rateKeyForIp,
+  settleSuccess,
   sha256Hex,
   splitAddress,
+  takeAttempt,
   timingSafeEqual,
   verifyPassword,
 } from './security';
@@ -30,13 +32,24 @@ export interface AdminEnv {
   PRIVATE_DOMAINS?: string;
   ADMIN_PASSWORD_HASH?: string;
   ADMIN_SESSION_SECRET?: string;
+  FORWARD_RULES?: string;
 }
 
 export const ADMIN_COOKIE = 'duckmail_admin';
 export const ADMIN_SESSION_SECONDS = 12 * 60 * 60;
+/** Failed admin logins allowed per 15 minutes from one IPv4 address or IPv6 /64. */
 export const ADMIN_LOGIN_FAILURE_LIMIT = 10;
+/**
+ * Failed admin logins allowed per 15 minutes from all sources together. Stops
+ * guessing spread over many IPs; the price is that someone who sends this
+ * many wrong passwords locks the login page for everyone until the window
+ * ends (signed-in sessions keep working). The owner can end the lock early:
+ * npx wrangler d1 execute temp_mail_db --remote --command "DELETE FROM auth_failures"
+ */
+export const ADMIN_LOGIN_GLOBAL_FAILURE_LIMIT = 30;
 const MIN_APP_PASSWORD_LENGTH = 12;
 const MESSAGES_PER_PAGE = 50;
+const MAILBOXES_PER_PAGE = 100;
 
 const PAGE_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
@@ -66,7 +79,7 @@ export async function handleAdmin(request: Request, env: AdminEnv): Promise<Resp
   const session = await readSession(request, env);
 
   if (method === 'GET' && path === '/admin') {
-    return session ? dashboard(env, session) : loginPage();
+    return session ? dashboard(env, session, url) : loginPage();
   }
 
   if (!session) {
@@ -181,8 +194,11 @@ async function readSession(request: Request, env: AdminEnv): Promise<Session | n
 // ------------------------------------------------------------ login/out
 
 async function login(request: Request, env: AdminEnv): Promise<Response> {
-  const rules = [{ key: 'admin-login:' + clientIp(request), limit: ADMIN_LOGIN_FAILURE_LIMIT }];
-  const wait = await blockedFor(env.TEMP_MAIL_DB, rules);
+  // The attempt is counted atomically before the (costly) password check, so
+  // parallel requests cannot exceed the limits; a success is refunded.
+  const ipRule = { key: 'admin-login:' + rateKeyForIp(clientIp(request)), limit: ADMIN_LOGIN_FAILURE_LIMIT };
+  const rules = [ipRule, { key: 'admin-login:all', limit: ADMIN_LOGIN_GLOBAL_FAILURE_LIMIT }];
+  const wait = await takeAttempt(env.TEMP_MAIL_DB, rules);
   if (wait > 0) {
     return loginPage('Too many failed attempts. Try again in ' + Math.ceil(wait / 60) + ' min.', 429, { 'Retry-After': String(wait) });
   }
@@ -193,10 +209,10 @@ async function login(request: Request, env: AdminEnv): Promise<Response> {
   const ok = password.length > 0 && password.length <= 1024
     && (await verifyPassword(password, env.ADMIN_PASSWORD_HASH));
   if (!ok) {
-    await recordFailure(env.TEMP_MAIL_DB, rules);
+    // The attempt taken above stays counted as a failure.
     return loginPage('Wrong password.', 401);
   }
-  await clearFailures(env.TEMP_MAIL_DB, rules.map(r => r.key));
+  await settleSuccess(env.TEMP_MAIL_DB, rules, [ipRule.key]);
   return redirect('/admin', { 'Set-Cookie': await createSessionCookie(env) });
 }
 
@@ -230,18 +246,53 @@ function privateAddressFilter(env: AdminEnv, column: string): { sql: string; bin
   return { sql: '(' + parts.join(' OR ') + ')', binds };
 }
 
-async function dashboard(env: AdminEnv, session: Session): Promise<Response> {
+/** Private addresses that have a FORWARD_RULES entry (pinned on the dashboard). */
+function forwardedPrivateAddresses(env: AdminEnv): string[] {
+  const raw = String(env.FORWARD_RULES || '').trim();
+  if (!raw) return [];
+  let rules: unknown;
+  try { rules = JSON.parse(raw); } catch (_) { return []; }
+  if (!rules || typeof rules !== 'object' || Array.isArray(rules)) return [];
+  return Object.keys(rules as Record<string, unknown>)
+    .map(normalizeAddress)
+    .filter(a => isPrivateAddress(env, a) && forwardTarget(env, a));
+}
+
+async function dashboard(env: AdminEnv, session: Session, url: URL): Promise<Response> {
   const db = env.TEMP_MAIL_DB;
+  const q = normalizeAddress(url.searchParams.get('q') || '').slice(0, 200);
+  const requestedPage = Math.max(1, Math.min(100000, parseInt(url.searchParams.get('page') || '1', 10) || 1));
+  const likeEsc = (v: string) => v.replace(/[\\%_]/g, c => '\\' + c);
+
   const mf = privateAddressFilter(env, 'm.address');
+  let where = mf.sql;
+  const whereBinds: string[] = [...mf.binds];
+  if (q) {
+    where += " AND m.address LIKE ? ESCAPE '\\'";
+    whereBinds.push('%' + likeEsc(q) + '%');
+  }
+  const total = Number((await db.prepare(`SELECT COUNT(*) AS c FROM mailboxes m WHERE ${where}`)
+    .bind(...whereBinds).first<any>())?.c || 0);
+  const pages = Math.max(1, Math.ceil(total / MAILBOXES_PER_PAGE));
+  const pageNo = Math.min(requestedPage, pages);
+
+  // Mailboxes with an app login or a forwarding rule come first, so real
+  // addresses (hello@, ...) stay on page 1 however much catch-all spam
+  // arrives; the rest by newest mail.
+  const forwarded = forwardedPrivateAddresses(env);
+  const pinSql = forwarded.length ? `OR m.address IN (${forwarded.map(() => '?').join(', ')})` : '';
   const mailboxes = ((await db.prepare(
-    `SELECT m.id, m.address, COUNT(msg.id) AS message_count, MAX(msg.received_at) AS newest,
-            (SELECT u.role FROM users u WHERE u.username = m.address LIMIT 1) AS login_role
-       FROM mailboxes m LEFT JOIN messages msg ON msg.mailbox_id = m.id
-      WHERE ${mf.sql}
-      GROUP BY m.id
-      ORDER BY (newest IS NULL), newest DESC, m.id DESC
-      LIMIT 500`
-  ).bind(...mf.binds).all<any>()).results || []).filter(r => isPrivateAddress(env, r.address));
+    `SELECT m.id, m.address,
+            (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id = m.id) AS message_count,
+            (SELECT MAX(x.received_at) FROM messages x WHERE x.mailbox_id = m.id) AS newest,
+            (SELECT u.role FROM users u WHERE lower(trim(u.username)) = m.address ORDER BY u.id LIMIT 1) AS login_role,
+            (EXISTS (SELECT 1 FROM users u WHERE lower(trim(u.username)) = m.address) ${pinSql}) AS pinned
+       FROM mailboxes m
+      WHERE ${where}
+      ORDER BY pinned DESC, (newest IS NULL), newest DESC, m.id DESC
+      LIMIT ? OFFSET ?`
+  ).bind(...forwarded, ...whereBinds, MAILBOXES_PER_PAGE, (pageNo - 1) * MAILBOXES_PER_PAGE).all<any>()).results || [])
+    .filter(r => isPrivateAddress(env, r.address));
 
   const uf = privateAddressFilter(env, 'u.username');
   const users = ((await db.prepare(
@@ -254,13 +305,20 @@ async function dashboard(env: AdminEnv, session: Session): Promise<Response> {
   const logins = users.filter(u => u.role === PRIVATE_ROLE);
 
   const domainList = privateDomains(env).map(esc).join(', ') || '(none configured)';
+  const forwardedSet = new Set(forwarded);
   const rows = mailboxes.map(m => `
     <tr>
       <td><a href="/admin/mailbox?id=${esc(m.id)}">${esc(m.address)}</a></td>
       <td class="num">${esc(m.message_count)}</td>
       <td>${esc(m.newest || '—')}</td>
-      <td>${loginLabel(m.login_role)}</td>
+      <td>${loginLabel(m.login_role)}${forwardedSet.has(m.address) ? ' · forwarded' : ''}</td>
     </tr>`).join('');
+  // Escaped as a whole: esc() turns the '&' into '&amp;' for the attribute.
+  const pageLink = (n: number) => esc('/admin?' + (q ? 'q=' + encodeURIComponent(q) + '&' : '') + 'page=' + n);
+  const nav = pages > 1 ? `<p>
+      ${pageNo > 1 ? `<a href="${pageLink(pageNo - 1)}">← previous</a>` : ''}
+      page ${pageNo} of ${pages}
+      ${pageNo < pages ? `<a href="${pageLink(pageNo + 1)}">next →</a>` : ''}</p>` : '';
 
   const leftoverRows = leftovers.map(u => `
     <tr>
@@ -281,9 +339,16 @@ async function dashboard(env: AdminEnv, session: Session): Promise<Response> {
     <p class="muted">Private domains: ${domainList}. Mail to these domains is stored but hidden from the public API.</p>
 
     <h2>Private mailboxes</h2>
+    <form method="get" action="/admin" class="search">
+      <label for="q">Find an address</label>
+      <input id="q" name="q" type="search" value="${esc(q)}" placeholder="hello@" autocomplete="off">
+      <button type="submit">Search</button>
+      ${q ? '<a href="/admin">clear</a>' : ''}
+    </form>
+    <p class="muted">${esc(total)} mailbox(es)${q ? ' matching' : ''}. Mailboxes with an app login or a forwarding rule are listed first.</p>
     ${mailboxes.length ? `<div class="scroll"><table>
       <thead><tr><th>Address</th><th class="num">Messages</th><th>Newest</th><th>App login</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>` : '<p class="muted">No mail received yet.</p>'}
+      <tbody>${rows}</tbody></table></div>${nav}` : `<p class="muted">${q ? 'No mailbox matches.' : 'No mail received yet.'}</p>`}
 
     <h2>Blocked leftovers</h2>
     <p class="muted">Logins on private domains that were created through the public API. They can no longer sign in; delete them to clean up.</p>
@@ -335,7 +400,7 @@ async function mailboxPage(env: AdminEnv, session: Session, url: URL): Promise<R
     `SELECT id, sender, subject, received_at, length(content) + length(coalesce(html_content, '')) AS size
        FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?`
   ).bind(mb.id, MESSAGES_PER_PAGE, (pageNo - 1) * MESSAGES_PER_PAGE).all<any>()).results || [];
-  const login = await db.prepare('SELECT id, role FROM users WHERE username = ? LIMIT 1').bind(mb.address).first<any>();
+  const login = await db.prepare('SELECT id, role FROM users WHERE lower(trim(username)) = ? ORDER BY id LIMIT 1').bind(mb.address).first<any>();
 
   const rows = msgs.map(m => `
     <tr>
@@ -523,10 +588,13 @@ function page(title: string, body: string, status = 200, extra: Record<string, s
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 16px 0; }
   .card.danger { border-color: var(--danger); }
   label { display:block; margin: 8px 0 4px; }
-  input[type=password], input[type=email] { width: 100%; max-width: 420px; padding: 8px; font: inherit; border:1px solid var(--line); border-radius:6px; background: var(--bg); color: var(--fg); }
+  input[type=password], input[type=email], input[type=search] { width: 100%; max-width: 420px; padding: 8px; font: inherit; border:1px solid var(--line); border-radius:6px; background: var(--bg); color: var(--fg); }
   button { font: inherit; padding: 6px 14px; margin-top: 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
   button.danger, .danger button { border-color: var(--danger); color: var(--danger); }
   form.inline { display: inline; } form.inline button { margin-top: 0; }
+  form.search input { display: inline-block; width: auto; min-width: 0; flex: 1 1 200px; }
+  form.search { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; } form.search label { width: 100%; margin: 0; }
+  form.search button { margin-top: 0; }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: .95rem; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }

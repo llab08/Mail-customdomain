@@ -21,7 +21,8 @@ export default defineConfig({
         bindings: {
           MAIL_DOMAIN: 'public.test other.test',
           PRIVATE_DOMAINS: 'private.test',
-          JWT_SECRET: 'test-jwt-secret-not-real',
+          JWT_SECRET: 'test-jwt-secret-not-real-0123456789abcdef',
+          CLIENT_IP_SECRET: 'test-client-ip-secret-not-real-0123456789',
           ADMIN_PASSWORD_HASH: `pbkdf2-sha256$${ITERATIONS}$${salt.toString('base64')}$${hash.toString('base64')}`,
           ADMIN_SESSION_SECRET: 'test-session-secret-not-real-0123456789abcdef',
           FORWARD_RULES: JSON.stringify({ 'hello@private.test': 'owner@forward.test' }),

@@ -168,43 +168,142 @@ async function storageKey(key: string): Promise<string> {
   return sha256Hex('auth-failure:' + key);
 }
 
+/** The address Cloudflare saw the request come from. */
 export function clientIp(request: Request): string {
   return request.headers.get('CF-Connecting-IP') || 'unknown';
 }
 
-/** Returns seconds until the oldest blocking window ends, or 0 when allowed. */
-export async function blockedFor(db: D1Database, rules: FailureRule[], now: number = nowSeconds()): Promise<number> {
-  await ensureAuthFailuresTable(db);
-  let wait = 0;
-  for (const rule of rules) {
-    const row = await db.prepare('SELECT count, window_start FROM auth_failures WHERE key = ?')
-      .bind(await storageKey(rule.key)).first<{ count: number; window_start: number }>();
-    if (!row) continue;
-    const ends = Number(row.window_start) + FAILURE_WINDOW_SECONDS;
-    if (ends > now && Number(row.count) >= rule.limit) wait = Math.max(wait, ends - now);
+/** Expands an IPv6 address to its 8 hextets, or returns null when it is not one. */
+function ipv6Hextets(ip: string): number[] | null {
+  let s = ip.trim().toLowerCase();
+  const zone = s.indexOf('%');
+  if (zone !== -1) s = s.slice(0, zone);
+  if (!/^[0-9a-f:.]+$/.test(s) || !s.includes(':')) return null;
+  // An embedded IPv4 tail (::ffff:192.0.2.1) becomes two hextets.
+  const v4 = s.match(/^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const b = v4.slice(2).map(Number);
+    if (b.some(x => x > 255)) return null;
+    s = v4[1] + ((b[0] << 8) | b[1]).toString(16) + ':' + ((b[2] << 8) | b[3]).toString(16);
   }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const parse = (part: string) => (part ? part.split(':') : []);
+  const head = parse(halves[0]);
+  const tail = halves.length === 2 ? parse(halves[1]) : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null;
+  const all = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail];
+  if (all.some(h => !/^[0-9a-f]{1,4}$/.test(h))) return null;
+  return all.map(h => parseInt(h, 16));
+}
+
+/**
+ * The key failure limits count per client: the whole address for IPv4, the
+ * /64 prefix for IPv6 (one end user usually holds a whole /64, so counting per
+ * address would give them a fresh allowance on every address in it).
+ */
+export function rateKeyForIp(ip: string): string {
+  const h = ipv6Hextets(ip);
+  if (!h) return String(ip || 'unknown').trim().toLowerCase() || 'unknown';
+  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff) {
+    // IPv4-mapped IPv6: count it like the IPv4 address it carries.
+    return `${h[6] >> 8}.${h[6] & 255}.${h[7] >> 8}.${h[7] & 255}`;
+  }
+  return h.slice(0, 4).map(x => x.toString(16)).join(':') + '::/64';
+}
+
+/** Headers the DuckMail web app's /api/mail proxy adds (see app/api/mail/route.ts). */
+export const CLIENT_IP_HEADER = 'X-DuckMail-Client-IP';
+export const CLIENT_IP_SIGNATURE_HEADER = 'X-DuckMail-Client-IP-Signature';
+/** How old a signed client-IP header may be (clock skew included). */
+export const CLIENT_IP_MAX_AGE_SECONDS = 300;
+const MIN_CLIENT_IP_SECRET_LENGTH = 32;
+
+/** HMAC-SHA256 over "v1.<unix seconds>.<ip>", base64url, as the proxy computes it. */
+export async function signClientIp(secret: string, ip: string, ts: number): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(`v1.${ts}.${ip}`)));
+  return `v1.${ts}.` + bytesToB64(sig).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * The client IP that failure limits are counted on.
+ *
+ * The DuckMail web app calls this Worker from its own server, so for web-app
+ * users CF-Connecting-IP is the app server's address, shared by everyone.
+ * The app therefore passes the browser's IP in X-DuckMail-Client-IP, signed
+ * with the shared secret CLIENT_IP_SECRET (HMAC over timestamp and IP). The
+ * header is used only when that signature is valid and fresh; anything else
+ * (no secret configured, no header, bad or old signature) falls back to
+ * CF-Connecting-IP, so a caller cannot choose its own IP.
+ */
+export async function limitClientIp(request: Request, env: { CLIENT_IP_SECRET?: string }, now: number = nowSeconds()): Promise<string> {
+  const direct = clientIp(request);
+  const secret = env.CLIENT_IP_SECRET;
+  if (typeof secret !== 'string' || secret.length < MIN_CLIENT_IP_SECRET_LENGTH) return direct;
+  const claimed = (request.headers.get(CLIENT_IP_HEADER) || '').trim();
+  const signature = (request.headers.get(CLIENT_IP_SIGNATURE_HEADER) || '').trim();
+  if (!claimed || !signature || claimed.length > 64 || !/^[0-9A-Fa-f:.]+$/.test(claimed)) return direct;
+  const m = signature.match(/^v1\.(\d{1,12})\.[A-Za-z0-9_-]{43}$/);
+  if (!m) return direct;
+  const ts = Number(m[1]);
+  if (Math.abs(now - ts) > CLIENT_IP_MAX_AGE_SECONDS) return direct;
+  const expected = await signClientIp(secret, claimed, ts);
+  return timingSafeEqual(expected, signature) ? claimed : direct;
+}
+
+/**
+ * Counts one attempt against every rule BEFORE the password is checked, in
+ * one D1 batch (an atomic transaction), and returns the seconds to wait when
+ * any rule is over its limit (0 = go ahead). Because the counter is taken
+ * first, parallel requests cannot all pass a "check, then record" gap.
+ *
+ * The caller settles every allowed attempt: on success with
+ * settleAttempt(db, rules, clearKeys) (the attempt is refunded, so only
+ * failures stay counted), on failure by doing nothing. A refused (429)
+ * attempt is refunded here, so the counter holds failures plus attempts
+ * still in flight.
+ */
+export async function takeAttempt(db: D1Database, rules: FailureRule[], now: number = nowSeconds()): Promise<number> {
+  await ensureAuthFailuresTable(db);
+  const expired = now - FAILURE_WINDOW_SECONDS;
+  const keys = await Promise.all(rules.map(r => storageKey(r.key)));
+  const results = await db.batch<{ count: number; window_start: number }>([
+    db.prepare('DELETE FROM auth_failures WHERE window_start <= ?').bind(expired),
+    ...keys.map(key => db.prepare(
+      `INSERT INTO auth_failures (key, count, window_start) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET count = auth_failures.count + 1
+       RETURNING count, window_start`
+    ).bind(key, now)),
+  ]);
+  let wait = 0;
+  rules.forEach((rule, i) => {
+    const row = results[i + 1]?.results?.[0];
+    if (!row) return;
+    if (Number(row.count) > rule.limit) {
+      wait = Math.max(wait, Number(row.window_start) + FAILURE_WINDOW_SECONDS - now, 1);
+    }
+  });
+  if (wait > 0) await refund(db, keys);
   return wait;
 }
 
-export async function recordFailure(db: D1Database, rules: FailureRule[], now: number = nowSeconds()): Promise<void> {
-  await ensureAuthFailuresTable(db);
-  const expired = now - FAILURE_WINDOW_SECONDS;
-  for (const rule of rules) {
-    await db.prepare(
-      `INSERT INTO auth_failures (key, count, window_start) VALUES (?, 1, ?)
-       ON CONFLICT(key) DO UPDATE SET
-         count = CASE WHEN auth_failures.window_start <= ? THEN 1 ELSE auth_failures.count + 1 END,
-         window_start = CASE WHEN auth_failures.window_start <= ? THEN excluded.window_start ELSE auth_failures.window_start END`
-    ).bind(await storageKey(rule.key), now, expired, expired).run();
-  }
-  await db.prepare('DELETE FROM auth_failures WHERE window_start <= ?').bind(expired).run();
+async function refund(db: D1Database, hashedKeys: string[]): Promise<void> {
+  if (!hashedKeys.length) return;
+  await db.batch(hashedKeys.map(key =>
+    db.prepare('UPDATE auth_failures SET count = max(count - 1, 0) WHERE key = ?').bind(key)));
 }
 
-export async function clearFailures(db: D1Database, keys: string[]): Promise<void> {
-  await ensureAuthFailuresTable(db);
-  for (const key of keys) {
-    await db.prepare('DELETE FROM auth_failures WHERE key = ?').bind(await storageKey(key)).run();
-  }
+/** A successful attempt: refunds it on every rule, and clears the rules in clearKeys entirely. */
+export async function settleSuccess(db: D1Database, rules: FailureRule[], clearKeys: string[] = []): Promise<void> {
+  const clear = new Set(clearKeys);
+  const refundKeys = await Promise.all(rules.filter(r => !clear.has(r.key)).map(r => storageKey(r.key)));
+  const clearHashed = await Promise.all([...clear].map(k => storageKey(k)));
+  await db.batch([
+    ...refundKeys.map(key => db.prepare('UPDATE auth_failures SET count = max(count - 1, 0) WHERE key = ?').bind(key)),
+    ...clearHashed.map(key => db.prepare('DELETE FROM auth_failures WHERE key = ?').bind(key)),
+  ]);
 }
 
 export function nowSeconds(): number {
@@ -220,14 +319,19 @@ export interface UserRow {
   role: string;
 }
 
-/** Finds the user for an address. Usernames are stored lower-cased; the raw form is a fallback. */
+/**
+ * Finds the login for an address. Matches on lower(trim(username)) (the
+ * previous Worker stored usernames as typed; an expression index,
+ * idx_users_username_norm, keeps this an index lookup). When old data holds
+ * more than one row for the same address, the oldest row wins, so a
+ * later-created duplicate can never take over an existing mailbox.
+ */
 export async function findUserByAddress(db: D1Database, address: unknown): Promise<UserRow | null> {
-  const raw = String(address ?? '').trim();
   const normalized = normalizeAddress(address);
   if (!normalized) return null;
   return db.prepare(
-    'SELECT id, username, password_hash, role FROM users WHERE username IN (?, ?) ORDER BY (username = ?) DESC LIMIT 1'
-  ).bind(normalized, raw, normalized).first<UserRow>();
+    'SELECT id, username, password_hash, role FROM users WHERE lower(trim(username)) = ? ORDER BY id ASC LIMIT 1'
+  ).bind(normalized).first<UserRow>();
 }
 
 /** Role given to logins the admin creates for private-domain addresses. */
@@ -241,26 +345,25 @@ export function userMayUseAddress(env: { PRIVATE_DOMAINS?: string }, user: { rol
 }
 
 /**
- * Re-checks a verified JWT against the database on every request: the user
- * must still exist with the same id, the token's mailbox must be that user's
- * mailbox, and private-domain mailboxes need an admin-created login. This
- * revokes tokens issued before a user was deleted or blocked.
+ * Re-checks a verified JWT against the database on every request: the
+ * token's user must still be the login for the token's address (the oldest
+ * row for it), the token's mailbox must be that address's mailbox, and
+ * private-domain mailboxes need an admin-created login. This revokes tokens
+ * issued before a user was deleted, re-created or blocked.
  */
 export async function tokenStillValid(env: { TEMP_MAIL_DB: D1Database; PRIVATE_DOMAINS?: string }, payload: any): Promise<boolean> {
   if (!payload || typeof payload !== 'object') return false;
-  const raw = String(payload.address ?? '').trim();
   const normalized = normalizeAddress(payload.address);
   if (!normalized) return false;
   const row = await env.TEMP_MAIL_DB.prepare(
-    `SELECT u.id AS user_id, u.role AS role, m.id AS mailbox_id, m.address AS mailbox_address
-       FROM users u LEFT JOIN mailboxes m ON m.address = lower(trim(u.username))
-      WHERE u.username IN (?, ?)
-      ORDER BY (u.username = ?) DESC LIMIT 1`
-  ).bind(normalized, raw, normalized).first<{ user_id: number; role: string; mailbox_id: number | null; mailbox_address: string | null }>();
+    `SELECT u.id AS user_id, u.role AS role, (SELECT m.id FROM mailboxes m WHERE m.address = ?) AS mailbox_id
+       FROM users u
+      WHERE lower(trim(u.username)) = ?
+      ORDER BY u.id ASC LIMIT 1`
+  ).bind(normalized, normalized).first<{ user_id: number; role: string; mailbox_id: number | null }>();
   if (!row || row.mailbox_id == null) return false;
   if (Number(row.user_id) !== Number(payload.userId)) return false;
   if (Number(row.mailbox_id) !== Number(payload.mailboxId)) return false;
-  if (!userMayUseAddress(env, { role: row.role }, row.mailbox_address)) return false;
   if (!userMayUseAddress(env, { role: row.role }, normalized)) return false;
   return true;
 }

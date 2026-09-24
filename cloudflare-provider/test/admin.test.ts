@@ -70,6 +70,50 @@ describe('admin login', () => {
     expect((await login(ADMIN_PASSWORD, { ip: '192.0.2.8' })).status).toBe(303);
   });
 
+  it('counts parallel wrong passwords atomically', async () => {
+    const res = await Promise.all(Array.from({ length: 30 }, (_, i) => login('wrong-' + i, { ip: '192.0.2.60' })));
+    expect(res.filter(r => r.status !== 429).length).toBeLessThanOrEqual(10);
+    expect(res.every(r => r.status === 401 || r.status === 429)).toBe(true);
+    expect((await login(ADMIN_PASSWORD, { ip: '192.0.2.60' })).status).toBe(429);
+  });
+
+  it('counts IPv6 clients per /64', async () => {
+    const codes: number[] = [];
+    for (let i = 1; i <= 30; i++) codes.push((await login('wrong', { ip: `2001:db8:1:2::${i.toString(16)}` })).status);
+    expect(codes.filter(c => c !== 429).length).toBe(10);
+    expect((await login(ADMIN_PASSWORD, { ip: '2001:db8:1:2::abcd' })).status).toBe(429);
+    expect((await login(ADMIN_PASSWORD, { ip: '2001:db8:1:3::1' })).status).toBe(303);
+  });
+
+  it('has an overall cap across all IPs; signed-in sessions keep working', async () => {
+    const cookie = await adminLogin('192.0.2.200');
+    for (let i = 0; i < 30; i++) expect((await login('wrong', { ip: `198.18.${i}.1` })).status).toBe(401);
+    const locked = await login(ADMIN_PASSWORD, { ip: '198.18.200.1' });
+    expect(locked.status).toBe(429);
+    expect(locked.headers.get('Set-Cookie')).toBeNull();
+    expect(await (await call('GET', '/admin', { cookie })).text()).toContain('Private mailboxes');
+    // The lock ends with the window.
+    await E.TEMP_MAIL_DB.prepare('UPDATE auth_failures SET window_start = window_start - 901').run();
+    expect((await login(ADMIN_PASSWORD, { ip: '198.18.200.1' })).status).toBe(303);
+  });
+
+  it('a successful login does not count toward the overall cap', async () => {
+    for (let i = 0; i < 40; i++) expect((await login(ADMIN_PASSWORD, { ip: '192.0.2.201' })).status).toBe(303);
+    for (let i = 0; i < 9; i++) expect((await login('wrong', { ip: '192.0.2.202' })).status).toBe(401);
+    expect((await login(ADMIN_PASSWORD, { ip: '192.0.2.203' })).status).toBe(303);
+  });
+
+  it('counts on the connecting IP only (ignores the web-app client-IP header)', async () => {
+    for (let i = 0; i < 10; i++) {
+      const res = await call('POST', '/admin/login', {
+        form: { password: 'wrong' }, origin: ORIGIN, ip: '192.0.2.90',
+        headers: { 'X-DuckMail-Client-IP': `198.51.100.${i + 1}`, 'X-DuckMail-Client-IP-Signature': 'v1.1.AAAA' },
+      });
+      expect(res.status).toBe(401);
+    }
+    expect((await login(ADMIN_PASSWORD, { ip: '192.0.2.90' })).status).toBe(429);
+  });
+
   it('ignores forged, tampered or stale cookies', async () => {
     const cookie = await adminLogin();
     const [name, value] = cookie.split('=');
@@ -270,5 +314,51 @@ describe('admin pages', () => {
     const pub = (await query('SELECT id FROM users WHERE username = ?', 'keep@public.test'))[0];
     expect((await call('POST', '/admin/users/delete', { cookie, origin: ORIGIN, form: { id: String(pub.id), csrf } })).status).toBe(404);
     expect(await query('SELECT id FROM users WHERE username = ?', 'keep@public.test')).toHaveLength(1);
+  });
+
+  it('pages the mailbox list, finds any address, and pins logins and forwarded addresses first', async () => {
+    // hello@ has a FORWARD_RULES entry (vitest.config.mts); team@ gets an app login.
+    await deliver({ to: 'hello@private.test', subject: 'real mail' });
+    await deliver({ to: 'team@private.test', subject: 'team mail' });
+    const cookie = await adminLogin();
+    const csrf = await csrfFrom(cookie);
+    await call('POST', '/admin/users/create', { cookie, origin: ORIGIN, form: { csrf, address: 'team@private.test', password: 'a-long-team-password' } });
+    // Then 150 catch-all spam mailboxes with newer mail.
+    const db = E.TEMP_MAIL_DB;
+    const stmts = [];
+    for (let i = 0; i < 150; i++) {
+      stmts.push(db.prepare("INSERT INTO mailboxes (address, local_part, domain) VALUES (?, ?, 'private.test')").bind(`spam${i}@private.test`, `spam${i}`));
+    }
+    await db.batch(stmts);
+    await db.prepare(`INSERT INTO messages (mailbox_id, sender, subject, content, received_at)
+      SELECT id, 'spam@example.com', 'spam', 'x', datetime('now', '+1 hour') FROM mailboxes WHERE address LIKE 'spam%'`).run();
+
+    const first = await (await call('GET', '/admin', { cookie })).text();
+    const body = first.slice(first.indexOf('Private mailboxes'), first.indexOf('Blocked leftovers'));
+    expect(body).toContain('152 mailbox(es)');
+    expect(body).toContain('page 1 of 2');
+    expect(body).toContain('href="/admin?page=2"');
+    // Pinned rows come before any spam row.
+    expect(body.indexOf('hello@private.test')).toBeGreaterThan(-1);
+    expect(body.indexOf('team@private.test')).toBeGreaterThan(-1);
+    expect(body.indexOf('hello@private.test')).toBeLessThan(body.indexOf('spam'));
+    expect(body.indexOf('team@private.test')).toBeLessThan(body.indexOf('spam'));
+    expect(body).toContain('forwarded');
+    expect((body.match(/<tr>/g) || []).length).toBe(1 + 100);
+
+    const second = await (await call('GET', '/admin?page=2', { cookie })).text();
+    expect(second).toContain('page 2 of 2');
+    expect((second.slice(second.indexOf('Private mailboxes'), second.indexOf('Blocked leftovers')).match(/<tr>/g) || []).length).toBe(1 + 52);
+
+    const found = await (await call('GET', '/admin?q=SPAM149', { cookie })).text();
+    expect(found).toContain('spam149@private.test');
+    expect(found).toContain('1 mailbox(es) matching');
+    expect(found).not.toContain('spam148@private.test');
+    // LIKE wildcards in the search are literal.
+    expect(await (await call('GET', '/admin?q=%25', { cookie })).text()).toContain('No mailbox matches.');
+    // The search value is escaped.
+    const evil = await (await call('GET', '/admin?q=%22%3E%3Cscript%3E', { cookie })).text();
+    expect(evil).not.toMatch(/<script/i);
+    expect(evil).toContain('value="&quot;&gt;&lt;script&gt;"');
   });
 });

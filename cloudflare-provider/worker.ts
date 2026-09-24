@@ -5,18 +5,18 @@ import { parseEmailBody } from './emailParser.js';
 import { handleAdmin } from './admin';
 import {
   USER_PBKDF2_ITERATIONS,
-  blockedFor,
-  clearFailures,
-  clientIp,
   findUserByAddress,
   forwardTarget,
   hashPassword,
   isLegacyHash,
   isPrivateAddress,
+  limitClientIp,
   normalizeAddress,
   publicDomains,
-  recordFailure,
+  rateKeyForIp,
+  settleSuccess,
   splitAddress,
+  takeAttempt,
   tokenStillValid,
   userMayUseAddress,
   verifyPassword,
@@ -28,8 +28,17 @@ interface Env {
   MAIL_DOMAIN: string;
   /** Private domains: mail is stored, only the admin portal (or admin-created logins) can read it. */
   PRIVATE_DOMAINS?: string;
-  JWT_TOKEN?: string;
+  /**
+   * Signs the API tokens (secret, 32+ characters). Required: the old JWT_TOKEN
+   * var is NOT used as a fallback, because its value is in the public repo
+   * history and anyone could sign tokens with it.
+   */
   JWT_SECRET?: string;
+  /**
+   * Shared with the DuckMail web app (secret, 32+ characters): lets its
+   * /api/mail proxy pass the browser's IP for the /token failure limits.
+   */
+  CLIENT_IP_SECRET?: string;
   /** pbkdf2-sha256$<iterations>$<salt b64>$<hash b64> of the admin password (secret). */
   ADMIN_PASSWORD_HASH?: string;
   /** HMAC key for the admin session cookie (secret, 32+ chars). */
@@ -39,14 +48,18 @@ interface Env {
   RESEND_API_KEY?: string;
 }
 
-/** Failed /token logins allowed per 15 minutes for one address from one IP. */
+/** Failed /token logins allowed per 15 minutes for one address from one client. */
 const TOKEN_FAILURES_PER_IP_AND_ADDRESS = 10;
-/**
- * Failed /token logins allowed per 15 minutes from one IP across all
- * addresses. Higher than the per-address limit because the DuckMail web app
- * proxies every user's login through its own server IP.
- */
+/** Failed /token logins allowed per 15 minutes from one client across all addresses. */
 const TOKEN_FAILURES_PER_IP = 100;
+/** Shortest JWT_SECRET the Worker accepts; the deploy script sets a 64-character one. */
+const MIN_JWT_SECRET_LENGTH = 32;
+
+/** The token signing key, or null when it is missing or too short (the Worker then fails closed). */
+function jwtSecretOf(env: Env): string | null {
+  const secret = env.JWT_SECRET;
+  return typeof secret === 'string' && secret.length >= MIN_JWT_SECRET_LENGTH ? secret : null;
+}
 
 // Bearer token verification function
 async function verifyBearerToken(authHeader: string | null, secret: string): Promise<any> {
@@ -180,7 +193,11 @@ export default {
       
       // Protected endpoints - require Bearer token
       const authHeader = request.headers.get('Authorization');
-      const jwtSecret = (env.JWT_SECRET || env.JWT_TOKEN) as string;
+      const jwtSecret = jwtSecretOf(env);
+      if (!jwtSecret) {
+        console.error('JWT_SECRET is missing or shorter than 32 characters; refusing all tokens.');
+        return errorResponse('Service not configured', 503);
+      }
       const payload = await verifyBearerToken(authHeader, jwtSecret);
       
       if (!payload) {
@@ -381,13 +398,23 @@ async function handleCreateToken(request: Request, env: Env): Promise<Response> 
     return errorResponse('Address and password are required');
   }
 
-  // Failure limits (D1): per IP+address, and per IP overall.
-  const ip = clientIp(request);
+  const jwtSecret = jwtSecretOf(env);
+  if (!jwtSecret) {
+    console.error('JWT_SECRET is missing or shorter than 32 characters; refusing to issue tokens.');
+    return errorResponse('Service not configured', 503);
+  }
+
+  // Failure limits (D1): per client+address, and per client overall. The
+  // client is the browser's IP when the web app's proxy vouches for it
+  // (signed header), else CF-Connecting-IP; IPv6 counts per /64.
+  const ip = rateKeyForIp(await limitClientIp(request, env));
   const rules = [
     { key: `token:${ip}:${normalizeAddress(address)}`, limit: TOKEN_FAILURES_PER_IP_AND_ADDRESS },
     { key: `token:${ip}`, limit: TOKEN_FAILURES_PER_IP },
   ];
-  const wait = await blockedFor(env.TEMP_MAIL_DB, rules);
+  // The attempt is counted before the password is checked (atomic), so
+  // parallel requests cannot exceed the limits.
+  const wait = await takeAttempt(env.TEMP_MAIL_DB, rules);
   if (wait > 0) {
     const res = errorResponse('Too many failed login attempts. Try again later.', 429);
     res.headers.set('Retry-After', String(wait));
@@ -404,10 +431,11 @@ async function handleCreateToken(request: Request, env: Env): Promise<Response> 
     && userMayUseAddress(env, user, address)
     && userMayUseAddress(env, user, user.username);
   if (!user || !ok) {
-    await recordFailure(env.TEMP_MAIL_DB, rules);
+    // The attempt taken above stays counted as a failure.
     return errorResponse('Invalid credentials', 401);
   }
-  await clearFailures(env.TEMP_MAIL_DB, [rules[0].key]);
+  // Success: not a failure. Clears this address's counter, refunds the per-client one.
+  await settleSuccess(env.TEMP_MAIL_DB, rules, [rules[0].key]);
 
   // Upgrade a legacy unsalted SHA-256 hash now that the password is known.
   if (isLegacyHash(user.password_hash)) {
@@ -423,7 +451,6 @@ async function handleCreateToken(request: Request, env: Env): Promise<Response> 
   }
   
   // Create JWT
-  const jwtSecret = (env.JWT_SECRET || env.JWT_TOKEN) as string;
   const token = await createJwt(jwtSecret, {
     address,
     mailboxId,

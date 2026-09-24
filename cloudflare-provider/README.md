@@ -36,7 +36,7 @@ Update the `wrangler.toml` file with your configuration:
 - Replace `<your-d1-database-id>` with the database ID from step 2
 - Replace `yourdomain.com` with your actual domain(s)
 - Set `MAIL_DOMAIN` (public) and `PRIVATE_DOMAINS` (private)
-- Set the secrets: `wrangler secret put JWT_SECRET`, `ADMIN_PASSWORD_HASH`, `ADMIN_SESSION_SECRET`
+- Set the secrets: `wrangler secret put JWT_SECRET`, `ADMIN_PASSWORD_HASH`, `ADMIN_SESSION_SECRET`, `CLIENT_IP_SECRET` (the same `CLIENT_IP_SECRET` value also goes into the web app's server environment)
 
 ### 4. Deploy the Worker
 
@@ -125,9 +125,10 @@ Plain variables (`wrangler.toml` → `[vars]`):
 
 Secrets (`wrangler secret put <NAME>`, never in `wrangler.toml`):
 
-- `JWT_SECRET`: signs API tokens. (`JWT_TOKEN` is still read as a fallback for old setups.)
+- `JWT_SECRET`: signs API tokens; at least 32 characters. Required: without it `/token` and every authenticated endpoint answer 503. The old `JWT_TOKEN` var is **not** read any more — its value is in this public repository's history, so tokens signed with it are forgeable.
 - `ADMIN_PASSWORD_HASH`: `pbkdf2-sha256$<iterations>$<salt base64>$<hash base64>` of the admin password. Workers accept at most 100,000 PBKDF2 iterations.
 - `ADMIN_SESSION_SECRET`: at least 32 random characters; signs the admin session cookie.
+- `CLIENT_IP_SECRET`: at least 32 random characters, shared with the DuckMail web app (server env var `CLIENT_IP_SECRET`, not `NEXT_PUBLIC_`). The app's `/api/mail` proxy sends each browser's IP in `X-DuckMail-Client-IP` with `X-DuckMail-Client-IP-Signature: v1.<unix time>.<base64url HMAC-SHA256(secret, "v1.<time>.<ip>")>`; the Worker uses that IP for the `/token` limits only when the signature is valid and at most 5 minutes old, otherwise `CF-Connecting-IP`.
 - `RESEND_API_KEY`: not used by the Worker.
 
 ## Admin portal
@@ -138,12 +139,13 @@ Secrets (`wrangler secret put <NAME>`, never in `wrangler.toml`):
 - "blocked leftovers": logins on private domains that were created through the public API — they can no longer sign in and can be deleted;
 - optional app logins for a private address (role `private`).
 
-Every POST needs the same `Origin` and a per-session CSRF token. Failed admin logins are limited to 10 per IP per 15 minutes. Email HTML is never inlined: it is served from `/admin/message/html` with `Content-Security-Policy: sandbox; default-src 'none'; img-src data: https:; style-src 'unsafe-inline'` inside an `<iframe sandbox>`. The admin portal cannot open public-domain mailboxes.
+Every POST needs the same `Origin` and a per-session CSRF token. Failed admin logins are limited to 10 per 15 minutes per IPv4 address or IPv6 /64, and to 30 per 15 minutes from all sources together (then the login page answers 429 for everyone until the window ends; signed-in sessions keep working; `npx wrangler d1 execute temp_mail_db --remote --command "DELETE FROM auth_failures"` clears it early). The mailbox list pages 100 at a time, has an address search, and lists mailboxes with an app login or a `FORWARD_RULES` entry first. Email HTML is never inlined: it is served from `/admin/message/html` with `Content-Security-Policy: sandbox; default-src 'none'; img-src data: https:; style-src 'unsafe-inline'` inside an `<iframe sandbox>`. The admin portal cannot open public-domain mailboxes.
 
 ## Abuse limits
 
 - `POST /accounts` for an address that already has a login answers 422 (Mail.tm "This value is already used."); passwords are never reset through it.
-- `POST /token`: 10 failed logins per 15 minutes per IP and address, 100 per IP overall (the DuckMail web app proxies all its users through its own server IP). Stored in the D1 table `auth_failures` as SHA-256 keys only.
+- `POST /token`: 10 failed logins per 15 minutes per client and address, 100 per client overall. The client is the browser IP signed by the web app's proxy (see `CLIENT_IP_SECRET`), else `CF-Connecting-IP`; IPv6 counts per /64. Each attempt is counted atomically *before* the password is checked (one D1 batch: `INSERT … ON CONFLICT DO UPDATE … RETURNING count`), so parallel requests cannot exceed the limits; successful logins are refunded. Stored in the D1 table `auth_failures` as SHA-256 keys only.
+- Logins are matched on `lower(trim(username))` (index `idx_users_username_norm`); when old data holds several rows for one address, the oldest wins, so a later twin such as `victim@` next to a legacy `Victim@` gets neither a token nor the mailbox.
 - New passwords are stored as salted PBKDF2; old unsalted SHA-256 hashes still verify and are upgraded on the next successful login.
 
 ## Tests

@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   forwardTarget, hashPassword, isPrivateAddress, publicDomains, sha256Hex, splitAddress, timingSafeEqual, verifyPassword,
-  bytesToB64,
+  bytesToB64, rateKeyForIp, signClientIp, limitClientIp, CLIENT_IP_HEADER, CLIENT_IP_SIGNATURE_HEADER,
 } from '../security';
 
 async function pbkdf2Hash(password: string, iterations: number): Promise<string> {
@@ -82,5 +82,69 @@ describe('FORWARD_RULES', () => {
     expect(forwardTarget({}, 'hello@private.test')).toBeNull();
     expect(forwardTarget({ FORWARD_RULES: 'not json' }, 'hello@private.test')).toBeNull();
     expect(forwardTarget({ FORWARD_RULES: '[]' }, 'hello@private.test')).toBeNull();
+  });
+});
+
+describe('rate-limit keys per client', () => {
+  it('keeps IPv4 addresses whole', () => {
+    expect(rateKeyForIp('198.51.100.7')).toBe('198.51.100.7');
+    expect(rateKeyForIp('198.51.100.8')).toBe('198.51.100.8');
+  });
+
+  it('groups IPv6 addresses by /64, in every spelling', () => {
+    const key = '2001:db8:1:2::/64';
+    for (const ip of ['2001:db8:1:2::1', '2001:db8:1:2::1e', '2001:0DB8:0001:0002:ffff:ffff:ffff:ffff', '2001:db8:1:2:0:0:0:9', '2001:db8:1:2::1%eth0']) {
+      expect(rateKeyForIp(ip), ip).toBe(key);
+    }
+    expect(rateKeyForIp('2001:db8:1:3::1')).toBe('2001:db8:1:3::/64');
+    expect(rateKeyForIp('::1')).toBe('0:0:0:0::/64');
+  });
+
+  it('counts IPv4-mapped IPv6 as the IPv4 address', () => {
+    expect(rateKeyForIp('::ffff:198.51.100.7')).toBe('198.51.100.7');
+  });
+
+  it('keeps anything unparsable as it is', () => {
+    expect(rateKeyForIp('unknown')).toBe('unknown');
+    expect(rateKeyForIp('1:2:3')).toBe('1:2:3');
+    expect(rateKeyForIp('')).toBe('unknown');
+  });
+});
+
+describe('signed client IP from the web-app proxy', () => {
+  const secret = 'test-client-ip-secret-not-real-0123456789';
+  const now = 1790000000;
+  const req = (headers: Record<string, string>) =>
+    new Request('https://worker.test/token', { method: 'POST', headers: { 'CF-Connecting-IP': '203.0.113.99', ...headers } });
+
+  it('matches the signature the Next.js proxy computes (node:crypto createHmac, base64url)', async () => {
+    // Vector computed with lib/client-ip-signature.ts's algorithm in Node.
+    expect(await signClientIp(secret, '2001:db8::7', now)).toBe('v1.1790000000.x6rssTwbJl5z4-pRJO1QO95kTzSNZRgpQcz7sOCtHVQ');
+  });
+
+  it('uses the header only with a valid, fresh signature', async () => {
+    const good = await signClientIp(secret, '198.51.100.20', now);
+    const env = { CLIENT_IP_SECRET: secret };
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good }), env, now)).toBe('198.51.100.20');
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good }), env, now + 299)).toBe('198.51.100.20');
+    // stale or from the future
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good }), env, now + 301)).toBe('203.0.113.99');
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good }), env, now - 301)).toBe('203.0.113.99');
+    // signature for another IP, tampered, missing, wrong secret
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.21', [CLIENT_IP_SIGNATURE_HEADER]: good }), env, now)).toBe('203.0.113.99');
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good.slice(0, -1) + 'A' }), env, now)).toBe('203.0.113.99');
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20' }), env, now)).toBe('203.0.113.99');
+    const other = await signClientIp(secret + 'x', '198.51.100.20', now);
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: other }), env, now)).toBe('203.0.113.99');
+    // not an IP
+    const junk = await signClientIp(secret, 'x<y>', now);
+    expect(await limitClientIp(req({ [CLIENT_IP_HEADER]: 'x<y>', [CLIENT_IP_SIGNATURE_HEADER]: junk }), env, now)).toBe('203.0.113.99');
+  });
+
+  it('ignores the header when CLIENT_IP_SECRET is missing or short', async () => {
+    const good = await signClientIp(secret, '198.51.100.20', now);
+    const headers = { [CLIENT_IP_HEADER]: '198.51.100.20', [CLIENT_IP_SIGNATURE_HEADER]: good };
+    expect(await limitClientIp(req(headers), {}, now)).toBe('203.0.113.99');
+    expect(await limitClientIp(req(headers), { CLIENT_IP_SECRET: 'short' }, now)).toBe('203.0.113.99');
   });
 });

@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { logger } from "@/lib/logger"
+import { addClientIpHeaders } from "@/lib/client-ip-signature"
 
 const DEFAULT_API_BASE_URL = (
   (process.env.NEXT_PUBLIC_CLOUDFLARE_WORKER_BASE_URL || "").trim() ||
@@ -41,6 +42,10 @@ async function handleRequest(
   if (!requestHeaders.has("User-Agent")) {
     requestHeaders.set("User-Agent", "DuckMail/1.0 (Vercel Function)")
   }
+
+  // Pass the browser's IP to the Worker (signed with CLIENT_IP_SECRET) so its
+  // failed-login limits count per user, not per this server's IP.
+  addClientIpHeaders(`${apiBaseUrl}${endpoint}`, originalRequest.headers, requestHeaders)
 
   const finalOptions: RequestInit = {
     ...options,
